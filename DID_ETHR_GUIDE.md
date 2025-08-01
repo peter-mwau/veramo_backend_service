@@ -100,6 +100,7 @@ curl -X POST http://localhost:3000/did/create \
 ```
 
 Response:
+
 ```json
 {
   "success": false,
@@ -121,6 +122,7 @@ Response:
 ### Complete Wallet-to-Credential Flow
 
 1. **Create Issuer DID**:
+
 ```bash
 curl -X POST http://localhost:3000/did/create \
   -H "Content-Type: application/json" \
@@ -132,6 +134,7 @@ curl -X POST http://localhost:3000/did/create \
 ```
 
 2. **Create Subject DID**:
+
 ```bash
 curl -X POST http://localhost:3000/did/create \
   -H "Content-Type: application/json" \
@@ -143,6 +146,7 @@ curl -X POST http://localhost:3000/did/create \
 ```
 
 3. **Create Verifiable Credential**:
+
 ```bash
 curl -X POST http://localhost:3000/credential/create \
   -H "Content-Type: application/json" \
