@@ -104,8 +104,8 @@ const NETWORK_CONFIGS = {
     sepolia: {
         name: "sepolia",
         chainId: 11155111,
-        rpcUrl: "https://sepolia.infura.io/v3/0ab3a5daf9d64bbaaeac8ae7c09af18e",
-        registry: "0x93eEc6FffeE62c79d5ef5Be5b0679aE928E8C1B2",
+        rpcUrl: "https://sepolia.infura.io/v3/189303beb46d46d8a0327f90f441168d", //fix
+        registry: "0xc0660d54f4655dC3B045D69ced4308f1709FD35e",//fix
     },
 };
 
