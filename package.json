@@ -3,26 +3,23 @@
     "version": "1.0.0",
     "description": "",
     "main": "index.js",
-    "scripts": 
-    {
+    "type": "module",
+    "scripts": {
         "start": "node server.js",
         "dev": "nodemon server-decentralized.js",
         "test": "echo \"Error: no test specified\" && exit 1"
     },
-    "repository": 
-    {
+    "repository": {
         "type": "git",
         "url": "git+https://github.com/peter-mwau/veramo_backend_service.git"
     },
     "author": "peter-mwau",
     "license": "MIT",
-    "bugs": 
-    {
+    "bugs": {
         "url": "https://github.com/peter-mwau/veramo_backend_service/issues"
     },
     "homepage": "https://github.com/peter-mwau/veramo_backend_service#readme",
-    "dependencies": 
-    {
+    "dependencies": {
         "@types/cors": "^2.8.19",
         "@veramo/core": "^6.0.0",
         "@veramo/credential-ld": "^6.0.0",
@@ -40,11 +37,14 @@
         "axios": "^1.11.0",
         "cors": "^2.8.5",
         "did-resolver": "^4.1.0",
+        "ethers": "^6.16.0",
         "ethr-did-resolver": "^11.0.4",
         "express": "^5.1.0",
         "key-did-resolver": "^4.0.0",
         "nodemon": "^3.1.10",
+        "qrcode.react": "^4.2.0",
+        "reflect-metadata": "^0.2.2",
         "sqlite3": "^5.1.7",
-        "typeorm": "^0.3.25"
+        "typeorm": "^0.3.28"
     }
 }
