@@ -1,9 +1,4 @@
 // src/veramo-ethr-did/server-decentralized.js
-// Decentralized version: Blockchain-first, database-optional architecture
-// - DIDs: Blockchain-based (no DB needed)
-// - VCs: Stored as JWTs (in-memory or client-side, no DB)
-// - Keys: Managed via environment/custodial solutions
-
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -11,12 +6,7 @@ import express from "express";
 import cors from "cors";
 import { createAgent } from "@veramo/core";
 import { CredentialPlugin } from "@veramo/credential-w3c";
-import {
-    KeyStore,
-    PrivateKeyStore,
-    DIDStore,
-    Entities,
-} from "@veramo/data-store";
+import { KeyStore, PrivateKeyStore, DIDStore, Entities } from "@veramo/data-store";
 import { DIDManager } from "@veramo/did-manager";
 import { EthrDIDProvider } from "@veramo/did-provider-ethr";
 import { KeyDIDProvider } from "@veramo/did-provider-key";
@@ -24,904 +14,1229 @@ import { DIDResolverPlugin } from "@veramo/did-resolver";
 import { KeyManager } from "@veramo/key-manager";
 import { KeyManagementSystem, SecretBox } from "@veramo/kms-local";
 import { MessageHandler } from "@veramo/message-handler";
-import { createConnection } from "typeorm";
+import { createConnection, EntitySchema } from "typeorm";
 import { Resolver } from "did-resolver";
 import { getResolver as ethrDidResolver } from "ethr-did-resolver";
 import { getResolver as keyDidResolver } from "key-did-resolver";
+import { randomBytes } from "crypto";
 
-// In-memory storage for VCs instead of database
+// -------------------------
+// EntitySchemas (SQL Persistence)
+// -------------------------
+
+const CredentialEntity = new EntitySchema({
+  name: "credential",
+  tableName: "credentials",
+  columns: {
+    id: { primary: true, type: Number, generated: true },
+    credentialId: { type: String, unique: true },
+    credential: { type: "simple-json" },
+    createdAt: { type: Date, createDate: true },
+  },
+});
+
+const PresentationEntity = new EntitySchema({
+  name: "presentation",
+  tableName: "presentations",
+  columns: {
+    id: { primary: true, type: Number, generated: true },
+    presentationId: { type: String, unique: true },
+    presentation: { type: "simple-json" },
+    createdAt: { type: Date, createDate: true },
+  },
+});
+
+// Share / ephemeral link entity
+const ShareEntity = new EntitySchema({
+  name: "share",
+  tableName: "shares",
+  columns: {
+    id: { primary: true, type: Number, generated: true },
+    token: { type: String, unique: true },
+    presentationId: { type: String },
+    ownerDid: { type: String, nullable: true },
+    payload: { type: "simple-json" }, // store presentation snapshot
+    expiresAt: { type: Date },
+    createdAt: { type: Date, createDate: true },
+  },
+});
+
+// NEW: VP presentation table storing issuer DID + holder DID
+const VPPresentationEntity = new EntitySchema({
+  name: "vp_presentation",
+  tableName: "vp_presentations",
+  columns: {
+    id: { primary: true, type: Number, generated: true },
+
+    presentationId: { type: String, unique: true },
+
+    ownerDid: { type: String, nullable: true, index: true },
+
+    holderDid: { type: String },
+
+    issuerDid: { type: String },
+
+    presentation: { type: "simple-json" },
+
+    createdAt: { type: Date, createDate: true },
+  },
+});
+
+// -------------------------
+// In-memory fallback stores
+// -------------------------
+
 const VCStore = {
-    credentials: new Map(), // credentialId -> credential
-    presentations: new Map(), // presentationId -> presentation
+  credentials: new Map(),
+  presentations: new Map(),
 
-    saveCredential(id, credential) {
-        this.credentials.set(id, { credential, timestamp: new Date().toISOString() });
-        return id;
-    },
+  saveCredential(id, credential) {
+    this.credentials.set(id, { credential, timestamp: new Date().toISOString() });
+    return id;
+  },
 
-    getCredential(id) {
-        return this.credentials.get(id);
-    },
+  getCredential(id) {
+    return this.credentials.get(id);
+  },
 
-    getAllCredentials() {
-        return Array.from(this.credentials.values()).map(item => item.credential);
-    },
+  getAllCredentials() {
+    return Array.from(this.credentials.values()).map((item) => item.credential);
+  },
 
-    savePresentation(id, presentation) {
-        this.presentations.set(id, { presentation, timestamp: new Date().toISOString() });
-        return id;
-    },
+  savePresentation(id, presentation) {
+    this.presentations.set(id, { presentation, timestamp: new Date().toISOString() });
+    return id;
+  },
 
-    getPresentation(id) {
-        return this.presentations.get(id);
-    },
+  getPresentation(id) {
+    return this.presentations.get(id);
+  },
 
-    getAllPresentations() {
-        return Array.from(this.presentations.values()).map(item => item.presentation);
-    }
+  getAllPresentations() {
+    return Array.from(this.presentations.values()).map((item) => item.presentation);
+  },
 };
 
-// In-memory DID registry instead of database
+// In-memory DID registry (session-only)
 const DIDRegistry = {
-    dids: new Map(), // did -> metadata
+  dids: new Map(),
 
-    registerDID(did, metadata = {}) {
-        this.dids.set(did, {
-            did,
-            createdAt: new Date().toISOString(),
-            ...metadata
-        });
-        return did;
-    },
+  registerDID(did, metadata = {}) {
+    this.dids.set(did, {
+      did,
+      createdAt: new Date().toISOString(),
+      ...metadata,
+    });
+    return did;
+  },
 
-    getDID(did) {
-        return this.dids.get(did);
-    },
+  getDID(did) {
+    return this.dids.get(did);
+  },
 
-    getAllDIDs() {
-        return Array.from(this.dids.values());
-    },
+  getAllDIDs() {
+    return Array.from(this.dids.values());
+  },
 
-    isDIDRegistered(did) {
-        return this.dids.has(did);
-    }
+  isDIDRegistered(did) {
+    return this.dids.has(did);
+  },
 };
 
-// SKALE Titan Network Configuration
+// -------------------------
+// Network Configuration
+// -------------------------
+
 const SKALE_TITAN_CONFIG = {
-    name: "skale-titan",
-    chainId: 1020352220,
-    rpcUrl: "https://testnet.skalenodes.com/v1/aware-fake-trim-testnet",
-    registry:
-        process.env.ETH_REGISTRY_ADDRESS_SEPOLIA ||
-        "0x0979446EB2A4a373eaA702336aC3c390B0139Fc5",
+  name: "skale-titan",
+  chainId: 1020352220,
+  rpcUrl: "https://testnet.skalenodes.com/v1/aware-fake-trim-testnet",
+  registry: process.env.ETH_REGISTRY_ADDRESS || "0x0979446EB2A4a373eaA702336aC3c390B0139Fc5",
 };
 
-// Network-specific configurations
 const NETWORK_CONFIGS = {
-    "skale-titan": SKALE_TITAN_CONFIG,
-    skale: SKALE_TITAN_CONFIG,
-    sepolia: {
-        name: "sepolia",
-        chainId: 11155111,
-        rpcUrl: "https://sepolia.infura.io/v3/189303beb46d46d8a0327f90f441168d", //fix
-        registry: "0xc0660d54f4655dC3B045D69ced4308f1709FD35e",//fix
-    },
+  "skale-titan": SKALE_TITAN_CONFIG,
+  skale: SKALE_TITAN_CONFIG,
+  sepolia: {
+    name: "sepolia",
+    chainId: 11155111,
+    rpcUrl:
+      process.env.ETH_PROVIDER_URL_SEPOLIA ||
+      "https://sepolia.infura.io/v3/189303beb46d46d8a0327f90f441168d",
+    registry: process.env.ETH_REGISTRY_ADDRESS_SEPOLIA || "0xc0660d54f4655dC3B045D69ced4308f1709FD35e",
+  },
 };
 
-// Get network configuration
 const getNetworkConfig = () => {
-    const networkName = process.env.ETH_NETWORK || "skale-titan";
-    const config = NETWORK_CONFIGS[networkName] || SKALE_TITAN_CONFIG;
+  const networkName = process.env.ETH_NETWORK || "skale-titan";
+  const config = NETWORK_CONFIGS[networkName] || SKALE_TITAN_CONFIG;
 
-    return {
-        name: config.name,
-        rpcUrl: process.env.ETH_PROVIDER_URL || config.rpcUrl,
-        registry: process.env.ETH_REGISTRY_ADDRESS || config.registry,
-        chainId: config.chainId,
-    };
+  return {
+    name: config.name,
+    rpcUrl: process.env.ETH_PROVIDER_URL || config.rpcUrl,
+    registry: process.env.ETH_REGISTRY_ADDRESS || config.registry,
+    chainId: config.chainId,
+  };
 };
 
-// Function to check registry contract deployment
+// -------------------------
+// Registry contract deployment check
+// -------------------------
+
 async function checkRegistryDeployment(networkConfig) {
-    try {
-        const { ethers } = await import("ethers");
-        const provider = new ethers.JsonRpcProvider(networkConfig.rpcUrl);
+  try {
+    const { ethers } = await import("ethers");
+    const provider = new ethers.JsonRpcProvider(networkConfig.rpcUrl);
 
-        const code = await provider.getCode(networkConfig.registry);
-        const isDeployed = code && code !== "0x";
+    const code = await provider.getCode(networkConfig.registry);
+    const isDeployed = code && code !== "0x";
 
-        console.log(
-            `Registry ${networkConfig.registry} on ${networkConfig.name}:`,
-            isDeployed ? "✅ Deployed" : "❌ Not deployed or no code"
-        );
+    console.log(
+      `Registry ${networkConfig.registry} on ${networkConfig.name}:`,
+      isDeployed ? "✅ Deployed" : "❌ Not deployed or no code"
+    );
 
-        if (!isDeployed && networkConfig.name === "skale-titan") {
-            const knownRegistries = [
-                "0xdca7ef03e98e0dc2b855be647c39abe984fcf21b",
-                "0xd1d374dda6c5e1c0fd927de1c6c0e9cb7d7f12d3",
-                "0x0000000000000000000000000000000000000000",
-            ];
+    if (!isDeployed && networkConfig.name === "skale-titan") {
+      const knownRegistries = [
+        "0xdca7ef03e98e0dc2b855be647c39abe984fcf21b",
+        "0xd1d374dda6c5e1c0fd927de1c6c0e9cb7d7f12d3",
+        "0x0000000000000000000000000000000000000000",
+      ];
 
-            for (const registry of knownRegistries) {
-                try {
-                    const registryCode = await provider.getCode(registry);
-                    const registryDeployed = registryCode && registryCode !== "0x";
+      for (const registry of knownRegistries) {
+        try {
+          const registryCode = await provider.getCode(registry);
+          const registryDeployed = registryCode && registryCode !== "0x";
 
-                    if (registryDeployed) {
-                        console.log(`Found working registry at: ${registry}`);
-                        return { isDeployed: true, registry };
-                    }
-                } catch (err) {
-                    console.log(`Failed to check registry ${registry}:`, err.message);
-                }
-            }
+          if (registryDeployed) {
+            console.log(`Found working registry at: ${registry}`);
+            return { isDeployed: true, registry };
+          }
+        } catch (err) {
+          console.log(`Failed to check registry ${registry}:`, err.message);
         }
-
-        return { isDeployed, registry: networkConfig.registry };
-    } catch (error) {
-        console.error(`Error checking registry deployment:`, error.message);
-        return { isDeployed: false, registry: networkConfig.registry };
+      }
     }
+
+    return { isDeployed, registry: networkConfig.registry };
+  } catch (error) {
+    console.error(`Error checking registry deployment:`, error.message);
+    return { isDeployed: false, registry: networkConfig.registry };
+  }
 }
 
-// Initialize Express app
+// -------------------------
+// VP Issuer DID extractor
+// -------------------------
+
+function extractIssuerDidFromCredentials(verifiableCredentials) {
+  try {
+    if (!Array.isArray(verifiableCredentials)) return null;
+
+    for (const vc of verifiableCredentials) {
+      // VC is object
+      if (vc && typeof vc === "object") {
+        if (vc.issuer) {
+          if (typeof vc.issuer === "string") return vc.issuer;
+          if (typeof vc.issuer === "object" && vc.issuer.id) return vc.issuer.id;
+        }
+      }
+
+      // VC is compact JWT
+      if (typeof vc === "string" && vc.split(".").length === 3) {
+        const payload = JSON.parse(Buffer.from(vc.split(".")[1], "base64").toString());
+        if (payload.iss) return payload.iss;
+      }
+    }
+
+    return null;
+  } catch (err) {
+    console.warn("Failed to extract issuer DID:", err.message);
+    return null;
+  }
+}
+
+// -------------------------
+// Express app setup
+// -------------------------
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-// Veramo agent (no database required)
 let agent;
-
-// Secret key for encryption - In production, use environment variables
-const SECRET_KEY =
-    process.env.SECRET_KEY ||
-    "3c186fb58980777698bab8e95f010f40fd0d04e14de8f49b551108351aefaf28";
-
-// Database connection - using in-memory SQLite for key management only
 let dbConnection;
 
-// Initialize Veramo agent with in-memory database
-// Keys are stored in-memory (not persisted across restarts)
+const SECRET_KEY =
+  process.env.SECRET_KEY ||
+  "3c186fb58980777698bab8e95f010f40fd0d04e14de8f49b551108351aefaf28";
+
+// -------------------------
+// DB helper wrapper
+// -------------------------
+
+const DB = {
+  async saveCredentialToDB(credentialId, credential) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(CredentialEntity);
+      const entity = repo.create({ credentialId, credential });
+      await repo.save(entity);
+      return credentialId;
+    } catch (e) {
+      console.warn("saveCredentialToDB fallback to in-memory:", e.message);
+      return VCStore.saveCredential(credentialId, credential);
+    }
+  },
+
+  async getCredentialFromDB(credentialId) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(CredentialEntity);
+      const entity = await repo.findOne({ where: { credentialId } });
+      return entity ? entity.credential : null;
+    } catch (e) {
+      console.warn("getCredentialFromDB fallback to in-memory:", e.message);
+      const found = VCStore.getCredential(credentialId);
+      return found ? found.credential : null;
+    }
+  },
+
+  async getAllCredentialsFromDB() {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(CredentialEntity);
+      const rows = await repo.find({ order: { id: "DESC" } });
+      return rows.map((r) => r.credential);
+    } catch (e) {
+      console.warn("getAllCredentialsFromDB fallback to in-memory:", e.message);
+      return VCStore.getAllCredentials();
+    }
+  },
+
+  async savePresentationToDB(presentationId, presentation) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(PresentationEntity);
+      const entity = repo.create({ presentationId, presentation });
+      await repo.save(entity);
+      return presentationId;
+    } catch (e) {
+      console.warn("savePresentationToDB fallback to in-memory:", e.message);
+      return VCStore.savePresentation(presentationId, presentation);
+    }
+  },
+
+  async getPresentationFromDB(presentationId) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(PresentationEntity);
+      const entity = await repo.findOne({ where: { presentationId } });
+      return entity ? entity.presentation : null;
+    } catch (e) {
+      console.warn("getPresentationFromDB fallback to in-memory:", e.message);
+      const found = VCStore.getPresentation(presentationId);
+      return found ? found.presentation : null;
+    }
+  },
+
+  async getAllPresentationsFromDB() {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(PresentationEntity);
+      const rows = await repo.find({ order: { id: "DESC" } });
+      return rows.map((r) => r.presentation);
+    } catch (e) {
+      console.warn("getAllPresentationsFromDB fallback to in-memory:", e.message);
+      return VCStore.getAllPresentations();
+    }
+  },
+
+  // NEW: save VP + issuer DID + holder DID
+  async saveVPPresentationToDB(presentationId, ownerDid, holderDid, issuerDid, presentation) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+
+      const repo = dbConnection.getRepository(VPPresentationEntity);
+
+      const entity = repo.create({
+        presentationId,
+        ownerDid,
+        holderDid,
+        issuerDid,
+        presentation,
+      });
+
+      await repo.save(entity);
+
+      return presentationId;
+    } catch (e) {
+      console.warn("saveVPPresentationToDB failed:", e.message);
+      return presentationId;
+    }
+  },
+
+  async getVPPresentationsByOwner(ownerDid) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(VPPresentationEntity);
+      const rows = await repo.find({
+        where: { ownerDid },
+        order: { id: "DESC" },
+      });
+      return rows;
+    } catch (e) {
+      console.warn("getVPPresentationsByOwner failed:", e.message);
+      return [];
+    }
+  },
+
+  async getAllVPPresentations() {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+
+      const repo = dbConnection.getRepository(VPPresentationEntity);
+      const rows = await repo.find({ order: { id: "DESC" } });
+
+      return rows;
+    } catch (e) {
+      console.warn("getAllVPPresentations failed:", e.message);
+      return [];
+    }
+  },
+
+  async getVPPresentationsByIssuer(issuerDid) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+
+      const repo = dbConnection.getRepository(VPPresentationEntity);
+
+      const rows = await repo.find({
+        where: { issuerDid },
+        order: { id: "DESC" },
+      });
+
+      return rows;
+    } catch (e) {
+      console.warn("getVPPresentationsByIssuer failed:", e.message);
+      return [];
+    }
+  },
+
+  // Save share record (token, payload, expiry)
+  async saveShareToDB(token, presentationId, ownerDid, payload, expiresAt) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(ShareEntity);
+      const entity = repo.create({
+        token,
+        presentationId,
+        ownerDid,
+        payload,
+        expiresAt,
+      });
+      await repo.save(entity);
+      return token;
+    } catch (e) {
+      console.warn("saveShareToDB failed:", e.message);
+      throw e;
+    }
+  },
+
+  // Retrieve share record by token
+  async getShareByToken(token) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(ShareEntity);
+      const entity = await repo.findOne({ where: { token } });
+      return entity || null;
+    } catch (e) {
+      console.warn("getShareByToken failed:", e.message);
+      return null;
+    }
+  },
+
+  // Delete (revoke) a share by token
+  async revokeShare(token) {
+    try {
+      if (!dbConnection) throw new Error("DB not initialized");
+      const repo = dbConnection.getRepository(ShareEntity);
+      const r = await repo.delete({ token });
+      return r.affected > 0;
+    } catch (e) {
+      console.warn("revokeShare failed:", e.message);
+      return false;
+    }
+  },
+};
+
+// -------------------------
+// Initialize Veramo agent + SQLite DB
+// -------------------------
+
 async function initializeAgent() {
-    try {
-        // Create in-memory SQLite connection for Veramo's key/DID stores
-        dbConnection = await createConnection({
-            type: "sqlite",
-            database: ":memory:", // In-memory database
-            synchronize: true,
-            logging: false,
-            entities: Entities,
-        });
-        console.log("In-memory database initialized (keys only, not persisted)");
+  try {
+    dbConnection = await createConnection({
+      type: "sqlite",
+      database: process.env.SQLITE_DB_PATH || "./veramo.sqlite",
+      synchronize: true,
+      logging: false,
+      entities: [...Entities, CredentialEntity, PresentationEntity, VPPresentationEntity, VPPresentationEntity, ShareEntity],
+    });
 
-        const networkConfig = getNetworkConfig();
-        console.log("Using network configuration:", networkConfig);
+    console.log("SQLite database initialized:", process.env.SQLITE_DB_PATH || "./veramo.sqlite");
 
-        // Check if registry is deployed
-        const registryCheck = await checkRegistryDeployment(networkConfig);
-        const actualRegistry = registryCheck.registry;
+    const networkConfig = getNetworkConfig();
+    console.log("Using network configuration:", networkConfig);
 
-        if (!registryCheck.isDeployed) {
-            console.warn(
-                `⚠️  Warning: ERC1056 registry not found at ${networkConfig.registry} on ${networkConfig.name}`
-            );
-            console.warn(
-                `⚠️  DID resolution will still work for did:key, but ethr DIDs may have limited functionality`
-            );
-        }
+    const registryCheck = await checkRegistryDeployment(networkConfig);
+    const actualRegistry = registryCheck.registry;
 
-        // Create agent with proper Veramo stores (in-memory, not persisted)
-        agent = createAgent({
-            plugins: [
-                // Key manager with in-memory store
-                new KeyManager({
-                    store: new KeyStore(dbConnection),
-                    kms: {
-                        local: new KeyManagementSystem(
-                            new PrivateKeyStore(dbConnection, new SecretBox(SECRET_KEY))
-                        ),
-                    },
-                }),
-                // DID Manager - blockchain-first
-                new DIDManager({
-                    store: new DIDStore(dbConnection),
-                    defaultProvider: "did:key",
-                    providers: {
-                        "did:ethr": new EthrDIDProvider({
-                            defaultKms: "local",
-                            network: networkConfig.name,
-                            rpcUrl: networkConfig.rpcUrl,
-                            registry: actualRegistry,
-                        }),
-                        "did:key": new KeyDIDProvider({ defaultKms: "local" }),
-                    },
-                }),
-                // DID Resolver - blockchain queries only
-                new DIDResolverPlugin({
-                    resolver: new Resolver({
-                        ...ethrDidResolver({
-                            networks: [
-                                // SKALE Titan network
-                                {
-                                    name: "skale-titan",
-                                    rpcUrl: NETWORK_CONFIGS["skale-titan"].rpcUrl,
-                                    registry: NETWORK_CONFIGS["skale-titan"].registry,
-                                },
-                                // Alias for SKALE
-                                {
-                                    name: "skale",
-                                    rpcUrl: NETWORK_CONFIGS["skale-titan"].rpcUrl,
-                                    registry: NETWORK_CONFIGS["skale-titan"].registry,
-                                },
-                                // Sepolia testnet
-                                {
-                                    name: "sepolia",
-                                    rpcUrl: NETWORK_CONFIGS["sepolia"].rpcUrl,
-                                    registry: NETWORK_CONFIGS["sepolia"].registry,
-                                },
-                            ],
-                        }),
-                        ...keyDidResolver(),
-                    }),
-                }),
-                // Credential plugin - stateless VC creation/verification
-                new CredentialPlugin(),
-                // Message handler
-                new MessageHandler({ messageHandlers: [] }),
-            ],
-        });
-
-        console.log(
-            "Veramo agent initialized (decentralized mode - in-memory only) with network:",
-            networkConfig.name
-        );
-    } catch (error) {
-        console.error("Error initializing agent:", error);
-        process.exit(1);
+    if (!registryCheck.isDeployed) {
+      console.warn(`⚠️  Warning: ERC1056 registry not found at ${networkConfig.registry} on ${networkConfig.name}`);
     }
+
+    agent = createAgent({
+      plugins: [
+        new KeyManager({
+          store: new KeyStore(dbConnection),
+          kms: {
+            local: new KeyManagementSystem(new PrivateKeyStore(dbConnection, new SecretBox(SECRET_KEY))),
+          },
+        }),
+
+        new DIDManager({
+          store: new DIDStore(dbConnection),
+          defaultProvider: "did:key",
+          providers: {
+            "did:ethr": new EthrDIDProvider({
+              defaultKms: "local",
+              network: networkConfig.name,
+              rpcUrl: networkConfig.rpcUrl,
+              registry: actualRegistry,
+            }),
+            "did:key": new KeyDIDProvider({ defaultKms: "local" }),
+          },
+        }),
+
+        new DIDResolverPlugin({
+          resolver: new Resolver({
+            ...ethrDidResolver({
+              networks: [
+                {
+                  name: "skale-titan",
+                  rpcUrl: NETWORK_CONFIGS["skale-titan"].rpcUrl,
+                  registry: NETWORK_CONFIGS["skale-titan"].registry,
+                },
+                {
+                  name: "skale",
+                  rpcUrl: NETWORK_CONFIGS["skale-titan"].rpcUrl,
+                  registry: NETWORK_CONFIGS["skale-titan"].registry,
+                },
+                {
+                  name: "sepolia",
+                  rpcUrl: NETWORK_CONFIGS["sepolia"].rpcUrl,
+                  registry: NETWORK_CONFIGS["sepolia"].registry,
+                },
+              ],
+            }),
+            ...keyDidResolver(),
+          }),
+        }),
+
+        new CredentialPlugin(),
+
+        new MessageHandler({ messageHandlers: [] }),
+      ],
+    });
+
+    console.log("✅ Veramo agent initialized successfully");
+  } catch (error) {
+    console.error("❌ Error initializing agent:", error);
+    process.exit(1);
+  }
 }
 
+// -------------------------
 // Routes
+// -------------------------
 
-// Health check endpoint
 app.get("/health", (req, res) => {
-    res.json({
-        status: "OK",
-        message: "Veramo Backend Service (Decentralized) is running",
-        architecture: "Blockchain-first, no central database",
-        timestamp: new Date().toISOString(),
-    });
+  res.json({
+    status: "OK",
+    message: "Veramo Backend Service (Decentralized) is running",
+    database: process.env.SQLITE_DB_PATH || "./veramo.sqlite",
+    timestamp: new Date().toISOString(),
+  });
 });
 
-// Get agent information
 app.get("/agent/info", async (req, res) => {
-    try {
-        const methods = await agent.availableMethods();
-        res.json({
-            availableMethods: methods,
-            architecture: "Decentralized - Blockchain and in-memory only",
-            features: {
-                did_creation: "Blockchain-based (ethr and key DIDs)",
-                did_resolution: "Blockchain queries only",
-                vc_issuance: "In-memory, JWTs",
-                vc_storage: "In-memory cache (no persistence)",
-            },
-        });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+  try {
+    const methods = agent ? await agent.availableMethods() : [];
+    res.json({
+      availableMethods: methods,
+      architecture: "Decentralized - Blockchain + SQLite persistence",
+      features: {
+        did_creation: "ethr + key DIDs",
+        did_resolution: "blockchain resolution",
+        vc_storage: "sqlite",
+        vp_storage: "sqlite + issuer DID storage",
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// Create a new DID
-app.post("/did/create", async (req, res) => {
-    try {
-        const { provider = "did:key", alias, walletAddress, network } = req.body;
-
-        // WALLET-BASED DID (for thirdweb integration)
-        // Use this when user connects their wallet - creates DID from existing wallet address
-        if (provider === "did:ethr" && walletAddress) {
-            // Validate Ethereum address format
-            if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
-                return res.status(400).json({
-                    success: false,
-                    error:
-                        "Invalid Ethereum wallet address format. Must be a 40-character hex string starting with '0x'",
-                });
-            }
-
-            const networkConfig = getNetworkConfig();
-            const targetNetwork = network || networkConfig.name;
-
-            // Structure: did:ethr:network:walletAddress
-            const didIdentifier = `did:ethr:${targetNetwork}:${walletAddress}`;
-
-            console.log(
-                `Creating wallet-based DID for network: ${targetNetwork}, address: ${walletAddress}`
-            );
-
-            // Check if DID already exists
-            if (DIDRegistry.isDIDRegistered(didIdentifier)) {
-                const existing = DIDRegistry.getDID(didIdentifier);
-                return res.json({
-                    success: true,
-                    identifier: {
-                        did: didIdentifier,
-                        provider: "did:ethr",
-                        walletAddress,
-                        network: targetNetwork,
-                    },
-                    message: "Wallet-based DID already exists",
-                    type: "wallet-based",
-                    note: "This DID is linked to your wallet address. You control it with your wallet private key."
-                });
-            }
-
-            // Register the wallet-based DID
-            DIDRegistry.registerDID(didIdentifier, {
-                provider: "did:ethr",
-                walletAddress,
-                network: targetNetwork,
-                type: "wallet-based",
-                alias: alias || `wallet-${walletAddress.slice(0, 10)}`
-            });
-
-            res.json({
-                success: true,
-                identifier: {
-                    did: didIdentifier,
-                    provider: "did:ethr",
-                    walletAddress,
-                    network: targetNetwork,
-                },
-                message: `Wallet-based DID created successfully`,
-                type: "wallet-based",
-                note: "This DID is linked to your wallet. Your wallet private key controls it.",
-                stored: "blockchain (resolved from ERC1056 registry)"
-            });
-        }
-        // GENERATED KEY DID (Veramo manages the key)
-        else if (provider === "did:ethr" && !walletAddress) {
-            // Generate a new key pair - Veramo controls the key
-            let createOptions = {
-                provider: "did:ethr",
-                alias: alias || `did-generated-${Date.now()}`,
-            };
-
-            const networkConfig = getNetworkConfig();
-            createOptions.options = {
-                anchor: false,
-                network: networkConfig.name,
-            };
-
-            console.log("Creating generated-key DID (Veramo manages the key)");
-
-            const identifier = await agent.didManagerCreate(createOptions);
-
-            // Register in our in-memory registry
-            DIDRegistry.registerDID(identifier.did, {
-                ...identifier,
-                type: "generated-key",
-                note: "This is a generated key. Veramo stores the private key."
-            });
-
-            res.json({
-                success: true,
-                identifier,
-                type: "generated-key",
-                note: "⚠️ This DID uses a generated key. For blockchain persistence, use wallet-based DIDs (pass walletAddress)",
-                stored: "in-memory (session only, not persisted)",
-                recommendation: "For production with thirdweb, use wallet-based DIDs: { provider: 'did:ethr', walletAddress: '0x...' }"
-            });
-        }
-        // SELF-ISSUED DID (did:key)
-        else if (provider === "did:key") {
-            let createOptions = {
-                provider: "did:key",
-                alias: alias || `key-${Date.now()}`,
-            };
-
-            console.log("Creating self-issued DID (did:key)");
-
-            const identifier = await agent.didManagerCreate(createOptions);
-
-            // Register in our in-memory registry
-            DIDRegistry.registerDID(identifier.did, {
-                ...identifier,
-                type: "self-issued",
-                note: "Self-issued DID, no blockchain required"
-            });
-
-            res.json({
-                success: true,
-                identifier,
-                type: "self-issued",
-                note: "Self-issued DID using did:key method. No blockchain required.",
-                stored: "in-memory (ephemeral, can be recreated)",
-            });
-        }
-        else {
-            res.status(400).json({
-                success: false,
-                error: "Invalid provider or missing required parameters",
-                supported_methods: {
-                    "wallet-based": {
-                        provider: "did:ethr",
-                        walletAddress: "0x742d35Cc6634C0532925a3b844Bc9e7595f42bE",
-                        network: "skale-titan (optional)",
-                        note: "Best for thirdweb integration"
-                    },
-                    "generated-key": {
-                        provider: "did:ethr",
-                        note: "Generates a new key, Veramo manages it"
-                    },
-                    "self-issued": {
-                        provider: "did:key",
-                        note: "Self-issued DID, no blockchain needed"
-                    },
-                },
-                success: false,
-                error: error.message,
-            });
-        }
-    }
-    catch (error) {
-        console.error("DID creation error:", error);
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-// Get all DIDs (from in-memory registry only)
-app.get("/did/list", async (req, res) => {
-    try {
-        const identifiers = DIDRegistry.getAllDIDs();
-        res.json({
-            success: true,
-            count: identifiers.length,
-            identifiers,
-            note: "Only DIDs created in this session are listed (no database persistence)",
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-// Get a specific DID
-app.get("/did/:did", async (req, res) => {
-    try {
-        const { did } = req.params;
-        const identifier = DIDRegistry.getDID(did);
-
-        if (!identifier) {
-            return res.status(404).json({
-                success: false,
-                error: "DID not found in this session",
-                note: "Use did:ethr with a wallet address for blockchain-persisted DIDs",
-            });
-        }
-
-        res.json({
-            success: true,
-            identifier,
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-// Resolve a DID Document
-app.get("/did/:did/resolve", async (req, res) => {
-    try {
-        const { did } = req.params;
-        console.log(`Attempting to resolve DID: ${did}`);
-
-        // Check if it's an ethr DID and validate network
-        if (did.startsWith("did:ethr:")) {
-            const parts = did.split(":");
-            if (parts.length >= 4) {
-                const network = parts[2];
-                const address = parts[3];
-
-                console.log(
-                    `DID components - Network: ${network}, Address: ${address}`
-                );
-
-                // For SKALE networks, try a simplified resolution first
-                if (network === "skale-titan" || network === "skale") {
-                    try {
-                        const resolution = await agent.resolveDid({ didUrl: did });
-                        return res.json({
-                            success: true,
-                            resolution,
-                            method: "blockchain-resolved",
-                        });
-                    } catch (standardError) {
-                        console.log(
-                            `Standard resolution failed, trying fallback approach:`,
-                            standardError.message
-                        );
-
-                        // Fallback: Create a basic DID document without registry
-                        const fallbackDidDocument = {
-                            "@context": ["https://www.w3.org/ns/did/v1"],
-                            id: did,
-                            verificationMethod: [
-                                {
-                                    id: `${did}#controller`,
-                                    type: "EcdsaSecp256k1RecoveryMethod2020",
-                                    controller: did,
-                                    blockchainAccountId: `eip155:1020352220:${address}`,
-                                },
-                            ],
-                            authentication: [`${did}#controller`],
-                            assertionMethod: [`${did}#controller`],
-                        };
-
-                        return res.json({
-                            success: true,
-                            resolution: {
-                                didDocumentMetadata: {
-                                    fallback: true,
-                                    message: "Registry call failed, using fallback DID document",
-                                },
-                                didResolutionMetadata: {
-                                    contentType: "application/did+ld+json",
-                                },
-                                didDocument: fallbackDidDocument,
-                            },
-                            method: "fallback",
-                        });
-                    }
-                }
-
-                const networkConfig = getNetworkConfig();
-                if (
-                    network !== networkConfig.name &&
-                    network !== "skale" &&
-                    network !== "skale-titan"
-                ) {
-                    return res.status(400).json({
-                        success: false,
-                        error: `Network '${network}' is not configured. Available networks: ${networkConfig.name}`,
-                    });
-                }
-            }
-        }
-
-        const resolution = await agent.resolveDid({ didUrl: did });
-        res.json({
-            success: true,
-            resolution,
-            method: "blockchain-resolved",
-        });
-    } catch (error) {
-        console.error(`DID resolution error for ${req.params.did}:`, error);
-
-        let errorMessage = error.message;
-        if (
-            error.message.includes("CALL_EXCEPTION") ||
-            error.message.includes("missing revert data")
-        ) {
-            errorMessage = `Registry contract error: ${error.message}. For decentralized DIDs, use did:ethr with a wallet address or did:key for self-issued DIDs.`;
-        }
-
-        res.status(500).json({
-            success: false,
-            error: errorMessage,
-            did: req.params.did,
-        });
-    }
-});
-
-// Create a Verifiable Credential (stateless - no database)
-app.post("/credential/create", async (req, res) => {
-    try {
-        const {
-            issuerDid,
-            subjectDid,
-            credentialSubject,
-            type = ["VerifiableCredential"],
-            expirationDate,
-        } = req.body;
-
-        if (!issuerDid || !subjectDid || !credentialSubject) {
-            return res.status(400).json({
-                success: false,
-                error:
-                    "Missing required fields: issuerDid, subjectDid, credentialSubject",
-            });
-        }
-
-        const credential = await agent.createVerifiableCredential({
-            credential: {
-                issuer: { id: issuerDid },
-                credentialSubject: {
-                    id: subjectDid,
-                    ...credentialSubject,
-                },
-                type,
-                ...(expirationDate && { expirationDate }),
-            },
-            proofFormat: "jwt",
-        });
-
-        // Store in in-memory cache (temporary)
-        const credentialId = `cred-${Date.now()}`;
-        VCStore.saveCredential(credentialId, credential);
-
-        res.json({
-            success: true,
-            credential,
-            credentialId,
-            storage: "in-memory (temporary, pass to client for persistence)",
-            note: "Credential is a JWT - store and manage on the client side for decentralization",
-        });
-    } catch (error) {
-        console.error("Credential creation error:", error);
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-// Verify a Verifiable Credential (stateless)
-app.post("/credential/verify", async (req, res) => {
-    try {
-        const { credential } = req.body;
-
-        if (!credential) {
-            return res.status(400).json({
-                success: false,
-                error: "Missing required field: credential",
-            });
-        }
-
-        const result = await agent.verifyCredential({ credential });
-
-        res.json({
-            success: true,
-            verification: result,
-            note: "Verification is stateless - no database lookup required",
-        });
-    } catch (error) {
-        console.error("Credential verification error:", error);
-
-        let errorMessage = error.message;
-        if (error.message && error.message.includes("EVM revert instruction")) {
-            errorMessage =
-                "SKALE network registry contract issue - verification requires blockchain interaction";
-        }
-
-        res.status(500).json({
-            success: false,
-            error: errorMessage,
-            originalError: error.message,
-        });
-    }
-});
-
-// Get all credentials (in-memory cache only)
-app.get("/credential/list", async (req, res) => {
-    try {
-        const credentials = VCStore.getAllCredentials();
-        res.json({
-            success: true,
-            count: credentials.length,
-            credentials,
-            note: "Only credentials created in this session. For true decentralization, store credentials on the client.",
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-// Create a Verifiable Presentation (stateless - no database)
-app.post("/presentation/create", async (req, res) => {
-    try {
-        const {
-            holderDid,
-            verifiableCredentials,
-            type = ["VerifiablePresentation"],
-            domain,
-            challenge,
-        } = req.body;
-
-        if (
-            !holderDid ||
-            !verifiableCredentials ||
-            !Array.isArray(verifiableCredentials)
-        ) {
-            return res.status(400).json({
-                success: false,
-                error:
-                    "Missing required fields: holderDid, verifiableCredentials (array)",
-            });
-        }
-
-        const presentation = await agent.createVerifiablePresentation({
-            presentation: {
-                holder: holderDid,
-                verifiableCredential: verifiableCredentials,
-                type,
-                ...(domain && { domain }),
-                ...(challenge && { challenge }),
-            },
-            proofFormat: "jwt",
-        });
-
-        // Store in in-memory cache (temporary)
-        const presentationId = `pres-${Date.now()}`;
-        VCStore.savePresentation(presentationId, presentation);
-
-        res.json({
-            success: true,
-            presentation,
-            presentationId,
-            storage: "in-memory (temporary, pass to client for persistence)",
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-// Verify a Verifiable Presentation (stateless)
-app.post("/presentation/verify", async (req, res) => {
-    try {
-        const { presentation, domain, challenge } = req.body;
-
-        if (!presentation) {
-            return res.status(400).json({
-                success: false,
-                error: "Missing required field: presentation",
-            });
-        }
-
-        const result = await agent.verifyPresentation({
-            presentation,
-            ...(domain && { domain }),
-            ...(challenge && { challenge }),
-        });
-
-        res.json({
-            success: true,
-            verification: result,
-            note: "Verification is stateless - no database lookup required",
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-// Get all presentations (in-memory cache only)
-app.get("/presentation/list", async (req, res) => {
-    try {
-        const presentations = VCStore.getAllPresentations();
-        res.json({
-            success: true,
-            count: presentations.length,
-            presentations,
-            note: "Only presentations created in this session.",
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-// Network status
 app.get("/network/status", async (req, res) => {
-    try {
-        const networkConfig = getNetworkConfig();
-        const isRegistryDeployed = await checkRegistryDeployment(networkConfig);
+  try {
+    const networkConfig = getNetworkConfig();
+    const registryCheck = await checkRegistryDeployment(networkConfig);
 
-        res.json({
-            success: true,
-            network: {
-                name: networkConfig.name,
-                chainId: networkConfig.chainId,
-                rpcUrl: networkConfig.rpcUrl,
-                registry: networkConfig.registry,
-                registryDeployed: isRegistryDeployed,
-            },
-            architecture: "Blockchain-first, decentralized",
+    res.json({
+      success: true,
+      network: {
+        name: networkConfig.name,
+        chainId: networkConfig.chainId,
+        rpcUrl: networkConfig.rpcUrl,
+        registry: networkConfig.registry,
+        registryDeployed: registryCheck,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// -------------------------
+// DID ROUTES
+// -------------------------
+
+app.post("/did/create", async (req, res) => {
+  try {
+    const { provider = "did:key", alias, walletAddress, network } = req.body;
+
+    if (provider === "did:ethr" && walletAddress) {
+      if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid Ethereum wallet address format",
         });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
+      }
+
+      const networkConfig = getNetworkConfig();
+      const targetNetwork = network || networkConfig.name;
+
+      const didIdentifier = `did:ethr:${targetNetwork}:${walletAddress}`;
+
+      if (DIDRegistry.isDIDRegistered(didIdentifier)) {
+        const existing = DIDRegistry.getDID(didIdentifier);
+        return res.json({
+          success: true,
+          identifier: existing,
+          message: "Wallet-based DID already exists",
         });
+      }
+
+      DIDRegistry.registerDID(didIdentifier, {
+        did: didIdentifier,
+        provider: "did:ethr",
+        walletAddress,
+        network: targetNetwork,
+        alias: alias || `wallet-${walletAddress.slice(0, 10)}`,
+      });
+
+      return res.json({
+        success: true,
+        identifier: {
+          did: didIdentifier,
+          provider: "did:ethr",
+          walletAddress,
+          network: targetNetwork,
+        },
+        message: "Wallet-based DID created successfully",
+      });
     }
+
+    if (provider === "did:ethr" && !walletAddress) {
+      const networkConfig = getNetworkConfig();
+
+      const identifier = await agent.didManagerCreate({
+        provider: "did:ethr",
+        alias: alias || `did-generated-${Date.now()}`,
+        options: {
+          anchor: false,
+          network: networkConfig.name,
+        },
+      });
+
+      DIDRegistry.registerDID(identifier.did, {
+        ...identifier,
+        type: "generated-key",
+      });
+
+      return res.json({ success: true, identifier });
+    }
+
+    if (provider === "did:key") {
+      const identifier = await agent.didManagerCreate({
+        provider: "did:key",
+        alias: alias || `key-${Date.now()}`,
+      });
+
+      DIDRegistry.registerDID(identifier.did, {
+        ...identifier,
+        type: "self-issued",
+      });
+
+      return res.json({ success: true, identifier });
+    }
+
+    return res.status(400).json({
+      success: false,
+      error: "Invalid provider",
+    });
+  } catch (error) {
+    console.error("DID creation error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// Error handling middleware
+app.get("/did/list", async (req, res) => {
+  try {
+    const identifiers = DIDRegistry.getAllDIDs();
+    res.json({ success: true, count: identifiers.length, identifiers });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/did/:did/resolve", async (req, res) => {
+  try {
+    const did = decodeURIComponent(req.params.did);
+
+    const resolution = await agent.resolveDid({ didUrl: did });
+
+    res.json({ success: true, resolution });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/did/:did", async (req, res) => {
+  try {
+    const did = decodeURIComponent(req.params.did);
+
+    const identifier = DIDRegistry.getDID(did);
+
+    if (!identifier) {
+      return res.status(404).json({ success: false, error: "DID not found in session" });
+    }
+
+    res.json({ success: true, identifier });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// -------------------------
+// VC ROUTES
+// -------------------------
+
+app.post("/credential/create", async (req, res) => {
+  try {
+    const { issuerDid, subjectDid, credentialSubject, type = ["VerifiableCredential"], expirationDate } = req.body;
+
+    if (!issuerDid || !subjectDid || !credentialSubject) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields: issuerDid, subjectDid, credentialSubject",
+      });
+    }
+
+    const credential = await agent.createVerifiableCredential({
+      credential: {
+        issuer: { id: issuerDid },
+        credentialSubject: { id: subjectDid, ...credentialSubject },
+        type,
+        ...(expirationDate && { expirationDate }),
+      },
+      proofFormat: "jwt",
+    });
+
+    const credentialId = `cred-${Date.now()}`;
+    await DB.saveCredentialToDB(credentialId, credential);
+
+    res.json({
+      success: true,
+      credential,
+      credentialId,
+      storage: "sqlite",
+    });
+  } catch (error) {
+    console.error("Credential creation error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/credential/verify", async (req, res) => {
+  try {
+    const { credential } = req.body;
+
+    if (!credential) {
+      return res.status(400).json({ success: false, error: "Missing credential" });
+    }
+
+    const result = await agent.verifyCredential({ credential });
+
+    res.json({ success: true, verification: result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/credential/list", async (req, res) => {
+  try {
+    const credentials = await DB.getAllCredentialsFromDB();
+    res.json({ success: true, count: credentials.length, credentials });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// -------------------------
+// VP ROUTES
+// -------------------------
+
+app.post("/presentation/create", async (req, res) => {
+  try {
+    const { holderDid, ownerDid: incomingOwnerDid, verifiableCredentials, type = ["VerifiablePresentation"], domain, challenge } = req.body;
+
+    if (!holderDid || !verifiableCredentials || !Array.isArray(verifiableCredentials)) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields: holderDid, verifiableCredentials (array)",
+      });
+    }
+
+    const looksLikeJwt = (s) => typeof s === "string" && s.split(".").length === 3;
+
+    const tryParseJSON = (s) => {
+      try {
+        return JSON.parse(s);
+      } catch (e) {
+        return null;
+      }
+    };
+
+    const buildW3CCredentialFromRaw = (raw) => {
+      const issuerId = raw.issuerDID || raw.issuer || raw.issuerId;
+      const subjectId = raw.subjectDID || raw.subject || raw.owner;
+
+      const subjectClaims = { ...(raw.claims || {}) };
+
+      for (const k of Object.keys(raw)) {
+        if (
+          ["issuerDID", "issuer", "issuerId", "subjectDID", "subject", "owner", "credentialType", "issuanceDate", "claims"].includes(k)
+        ) {
+          continue;
+        }
+        subjectClaims[k] = raw[k];
+      }
+
+      const types = Array.isArray(raw.credentialType)
+        ? raw.credentialType
+        : raw.credentialType
+          ? [raw.credentialType]
+          : ["VerifiableCredential"];
+
+      const issuanceDate =
+        raw.issuanceDate && !isNaN(Number(raw.issuanceDate))
+          ? String(raw.issuanceDate).length > 12
+            ? new Date(Number(raw.issuanceDate)).toISOString()
+            : new Date(Number(raw.issuanceDate) * 1000).toISOString()
+          : raw.issuanceDate || new Date().toISOString();
+
+      const credential = {
+        "@context": ["https://www.w3.org/2018/credentials/v1"],
+        id: raw.id || undefined,
+        type: types,
+        issuer: issuerId ? { id: issuerId } : undefined,
+        issuanceDate,
+        credentialSubject: {
+          id: subjectId || undefined,
+          ...subjectClaims,
+        },
+      };
+
+      Object.keys(credential).forEach((k) => credential[k] === undefined && delete credential[k]);
+
+      return credential;
+    };
+
+    const normalizedCredentials = [];
+
+    for (const entry of verifiableCredentials) {
+      let item = entry;
+
+      if (item && typeof item === "object" && (item.jwt || item.verifiableCredential)) {
+        const candidate = item.jwt || item.verifiableCredential;
+        if (looksLikeJwt(candidate)) {
+          normalizedCredentials.push(candidate);
+          continue;
+        }
+        item = candidate;
+      }
+
+      if (typeof item === "string") {
+        if (looksLikeJwt(item)) {
+          normalizedCredentials.push(item);
+          continue;
+        }
+
+        const parsed = tryParseJSON(item);
+        if (parsed) {
+          item = parsed;
+        } else {
+          return res.status(400).json({
+            success: false,
+            error: "Credential string is neither a JWT nor valid JSON",
+            sample: item,
+          });
+        }
+      }
+
+      if (item && typeof item === "object") {
+        if (item.proof || item["@context"] || item.verifiableCredential) {
+          normalizedCredentials.push(item);
+          continue;
+        }
+
+        const w3c = buildW3CCredentialFromRaw(item);
+
+        if (!w3c.issuer) {
+          if (req.body.issuerDid) {
+            w3c.issuer = { id: req.body.issuerDid };
+          } else {
+            if (holderDid) {
+              w3c.issuer = { id: holderDid };
+            } else {
+              return res.status(400).json({
+                success: false,
+                error: "Raw credential missing issuer DID",
+              });
+            }
+          }
+        }
+
+        let created;
+        try {
+          created = await agent.createVerifiableCredential({
+            credential: w3c,
+            proofFormat: "jwt",
+          });
+        } catch (err) {
+          console.error("Error creating JWT for raw credential:", err);
+          return res.status(500).json({
+            success: false,
+            error: "Failed to convert raw credential to JWT",
+            originalError: err.message,
+            w3c,
+          });
+        }
+
+        if (typeof created === "string") {
+          normalizedCredentials.push(created);
+        } else if (created.verifiableCredential && typeof created.verifiableCredential === "string") {
+          normalizedCredentials.push(created.verifiableCredential);
+        } else if (created.jwt && typeof created.jwt === "string") {
+          normalizedCredentials.push(created.jwt);
+        } else {
+          normalizedCredentials.push(created);
+        }
+
+        continue;
+      }
+
+      return res.status(400).json({
+        success: false,
+        error: "Unsupported credential format",
+        entry: item,
+      });
+    }
+
+    const presentation = await agent.createVerifiablePresentation({
+      presentation: {
+        holder: holderDid,
+        verifiableCredential: normalizedCredentials,
+        type,
+        ...(domain && { domain }),
+        ...(challenge && { challenge }),
+      },
+      proofFormat: "jwt",
+    });
+
+    const presentationId = `pres-${Date.now()}`;
+
+    // extract issuer DID and store in SQL
+    const issuerDid = extractIssuerDidFromCredentials(normalizedCredentials);
+
+    let ownerDidToStore = incomingOwnerDid || null;
+
+    if (!ownerDidToStore) {
+      try {
+        const first = normalizedCredentials[0];
+        if (typeof first === "string" && first.split(".").length === 3) {
+          // JWT: inspect payload
+          const payload = JSON.parse(Buffer.from(first.split(".")[1], "base64").toString());
+          if (payload.sub) ownerDidToStore = payload.sub;
+          // some VCs use credentialSubject.id inside 'vc' claim - attempt a few heuristics if needed
+        } else if (first && typeof first === "object") {
+          const subj = first.credentialSubject || first.vc?.credentialSubject;
+          if (subj && subj.id) ownerDidToStore = subj.id;
+        }
+      } catch (e) {
+        console.warn("Failed to extract owner DID from credentials for VP storage:", e.message);
+      }
+    }
+
+    await DB.saveVPPresentationToDB(
+      presentationId,
+      ownerDidToStore,
+      holderDid,
+      issuerDid || "UNKNOWN_ISSUER",
+      presentation
+    );
+
+    res.json({
+      success: true,
+      presentation,
+      presentationId,
+      ownerDid: ownerDidToStore || null,
+      holderDid,
+      issuerDid: issuerDid || "UNKNOWN_ISSUER",
+      storage: "sqlite",
+      table: "vp_presentations",
+    });
+  } catch (error) {
+    console.error("Presentation creation error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+app.post("/presentation/verify", async (req, res) => {
+  try {
+    const { presentation, domain, challenge } = req.body;
+
+    if (!presentation) {
+      return res.status(400).json({ success: false, error: "Missing required field: presentation" });
+    }
+
+    const result = await agent.verifyPresentation({
+      presentation,
+      ...(domain && { domain }),
+      ...(challenge && { challenge }),
+    });
+
+    res.json({ success: true, verification: result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+
+// VP list from SQL table (with issuer DID)
+app.get("/vp/list", async (req, res) => {
+  try {
+    const rows = await DB.getAllVPPresentations();
+
+    res.json({
+      success: true,
+      count: rows.length,
+      presentations: rows,
+      table: "vp_presentations",
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Query VP by issuer DID
+app.get("/vp/issuer/:issuerDid", async (req, res) => {
+  try {
+    const issuerDid = decodeURIComponent(req.params.issuerDid);
+
+    const rows = await DB.getVPPresentationsByIssuer(issuerDid);
+
+    res.json({
+      success: true,
+      issuerDid,
+      count: rows.length,
+      presentations: rows,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Query VP by ownerDid (original subject/wallet DID)
+app.get("/vp/owner/:ownerDid", async (req, res) => {
+  try {
+    const ownerDid = decodeURIComponent(req.params.ownerDid);
+    const rows = await DB.getVPPresentationsByOwner(ownerDid);
+
+    res.json({
+      success: true,
+      ownerDid,
+      count: rows.length,
+      presentations: rows,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create ephemeral share link for a presentation
+app.post("/share/create", async (req, res) => {
+  try {
+    const { presentationId, ttlSeconds = 3600, ownerDid } = req.body;
+    if (!presentationId) return res.status(400).json({ success: false, error: "Missing presentationId" });
+
+    // load presentation from DB
+    const repo = dbConnection.getRepository(VPPresentationEntity);
+    const presentationRow = await repo.findOne({ where: { presentationId } });
+    if (!presentationRow) return res.status(404).json({ success: false, error: "Presentation not found" });
+
+    const token = randomBytes(20).toString("hex"); // 40 hex chars
+    const expiresAt = new Date(Date.now() + Number(ttlSeconds) * 1000);
+
+    // store a snapshot payload so share persists even if original row is removed
+    const payload = {
+      presentation: presentationRow.presentation,
+      presentationId: presentationRow.presentationId,
+      ownerDid: ownerDid || presentationRow.ownerDid || null,
+      holderDid: presentationRow.holderDid,
+      issuerDid: presentationRow.issuerDid,
+      createdAt: presentationRow.createdAt,
+    };
+
+    await DB.saveShareToDB(token, presentationId, ownerDid || presentationRow.ownerDid || null, payload, expiresAt);
+
+    const base = process.env.SHARE_BASE_URL || `http://localhost:${PORT}`;
+    const shareUrl = `${base}/share/view/${token}`;
+
+    res.json({ success: true, token, shareUrl, expiresAt: expiresAt.toISOString() });
+  } catch (error) {
+    console.error("share/create error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// View share by token - returns JSON presentation if valid and not expired
+app.get("/share/view/:token", async (req, res) => {
+  try {
+    const token = req.params.token;
+    const share = await DB.getShareByToken(token);
+    if (!share) return res.status(404).send("Share not found");
+
+    if (new Date(share.expiresAt).getTime() < Date.now()) {
+      return res.status(410).send("Share has expired");
+    }
+
+    return res.json({
+      success: true,
+      presentation: share.payload.presentation,
+      presentationId: share.presentationId,
+      ownerDid: share.ownerDid,
+      issuerDid: share.payload.issuerDid,
+      holderDid: share.payload.holderDid,
+      expiresAt: share.expiresAt,
+    });
+  } catch (error) {
+    console.error("share/view error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Revoke share (delete)
+app.post("/share/revoke", async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false, error: "Missing token" });
+
+    const ok = await DB.revokeShare(token);
+    if (!ok) return res.status(404).json({ success: false, error: "Token not found" });
+
+    res.json({ success: true, revoked: true });
+  } catch (error) {
+    console.error("share/revoke error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// -------------------------
+// Global error + 404
+// -------------------------
+
 app.use((error, req, res, next) => {
-    console.error("Unhandled error:", error);
-    res.status(500).json({
-        success: false,
-        error: "Internal server error",
-    });
+  console.error("Unhandled error:", error);
+  res.status(500).json({ success: false, error: "Internal server error" });
 });
 
-// 404 handler
 app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        error: "Endpoint not found",
-    });
+  res.status(404).json({ success: false, error: "Endpoint not found" });
 });
 
+// -------------------------
 // Start server
-async function startServer() {
-    await initializeAgent();
+// -------------------------
 
-    app.listen(PORT, () => {
-        console.log(
-            `🚀 Veramo Backend Service (Decentralized) is running on port ${PORT}`
-        );
-        console.log("📋 Architecture: Blockchain-first, no central database");
-        console.log("📖 API Documentation available at http://localhost:${PORT}/health");
-        console.log("🔑 Available endpoints:");
-        console.log("  GET  /health - Health check");
-        console.log("  GET  /agent/info - Agent information");
-        console.log("  GET  /network/status - Network and registry status");
-        console.log("  POST /did/create - Create blockchain-based DID");
-        console.log("  GET  /did/list - List DIDs from this session");
-        console.log("  GET  /did/:did - Get specific DID");
-        console.log("  GET  /did/:did/resolve - Resolve DID from blockchain");
-        console.log("  POST /credential/create - Create verifiable credential (JWT)");
-        console.log("  POST /credential/verify - Verify credential (stateless)");
-        console.log("  GET  /credential/list - List credentials from this session");
-        console.log("  POST /presentation/create - Create verifiable presentation");
-        console.log("  POST /presentation/verify - Verify presentation (stateless)");
-        console.log("  GET  /presentation/list - List presentations from this session");
-    });
+async function startServer() {
+  await initializeAgent();
+
+  app.listen(PORT, () => {
+    console.log(`🚀 Veramo Backend Service running on port ${PORT}`);
+    console.log(`📦 SQLite DB: ${process.env.SQLITE_DB_PATH || "./veramo.sqlite"}`);
+    console.log("🔑 Key endpoints:");
+    console.log("  GET  /health");
+    console.log("  POST /did/create");
+    console.log("  GET  /did/list");
+    console.log("  GET  /did/:did/resolve");
+    console.log("  POST /credential/create");
+    console.log("  GET  /credential/list");
+    console.log("  POST /presentation/create");
+    console.log("  POST /presentation/verify");
+    console.log("  GET  /vp/list");
+    console.log("  GET  /vp/issuer/:issuerDid");
+    console.log("  POST /share/create");
+    console.log("  GET  /share/view/:token");
+    console.log("  POST /share/revoke");
+  });
 }
 
-// Handle process termination
 process.on("SIGINT", async () => {
-    console.log("\n⏱️  Shutting down gracefully...");
-    if (dbConnection) {
-        await dbConnection.close();
-        console.log("📦 In-memory database connection closed");
-    }
-    process.exit(0);
+  console.log("⏱️ Shutting down gracefully...");
+  if (dbConnection) {
+    await dbConnection.close();
+    console.log("📦 SQLite database connection closed");
+  }
+  process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
-    console.log("\n⏱️  Shutting down gracefully...");
-    if (dbConnection) {
-        await dbConnection.close();
-        console.log("📦 In-memory database connection closed");
-    }
-    process.exit(0);
+  console.log("⏱️ Shutting down gracefully...");
+  if (dbConnection) {
+    await dbConnection.close();
+    console.log("📦 SQLite database connection closed");
+  }
+  process.exit(0);
 });
 
-// Start the server
 startServer().catch((error) => {
-    console.error("Failed to start server:", error);
-    process.exit(1);
+  console.error("Failed to start server:", error);
+  process.exit(1);
 });
