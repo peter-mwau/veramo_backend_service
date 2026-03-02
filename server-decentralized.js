@@ -262,6 +262,7 @@ function extractIssuerDidFromCredentials(verifiableCredentials) {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const FRONTEND_PORT = process.env.FRONTEND_PORT || 5173;
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -831,26 +832,11 @@ app.post("/presentation/create", async (req, res) => {
       }
     };
 
+    // Heuristic function to convert raw credential data into W3C format
     const buildW3CCredentialFromRaw = (raw) => {
+
       const issuerId = raw.issuerDID || raw.issuer || raw.issuerId;
-      const subjectId = raw.subjectDID || raw.subject || raw.owner;
-
-      const subjectClaims = { ...(raw.claims || {}) };
-
-      for (const k of Object.keys(raw)) {
-        if (
-          ["issuerDID", "issuer", "issuerId", "subjectDID", "subject", "owner", "credentialType", "issuanceDate", "claims"].includes(k)
-        ) {
-          continue;
-        }
-        subjectClaims[k] = raw[k];
-      }
-
-      const types = Array.isArray(raw.credentialType)
-        ? raw.credentialType
-        : raw.credentialType
-          ? [raw.credentialType]
-          : ["VerifiableCredential"];
+      const subjectId = raw.subjectDID || raw.owner || raw.subject;
 
       const issuanceDate =
         raw.issuanceDate && !isNaN(Number(raw.issuanceDate))
@@ -859,21 +845,28 @@ app.post("/presentation/create", async (req, res) => {
             : new Date(Number(raw.issuanceDate) * 1000).toISOString()
           : raw.issuanceDate || new Date().toISOString();
 
-      const credential = {
+      return {
         "@context": ["https://www.w3.org/2018/credentials/v1"],
-        id: raw.id || undefined,
-        type: types,
-        issuer: issuerId ? { id: issuerId } : undefined,
-        issuanceDate,
-        credentialSubject: {
-          id: subjectId || undefined,
-          ...subjectClaims,
+
+        type: [
+          "VerifiableCredential",
+          ...(raw.credentialType || [])
+        ],
+
+        issuer: {
+          id: issuerId
         },
+
+        issuanceDate,
+
+        credentialSubject: {
+          id: subjectId,
+          name: raw.subject || raw.name,      // 🔑 ensures Norman Tiny appears
+          course: raw.course,
+          credentialID: raw.credentialID,
+          owner: raw.owner
+        }
       };
-
-      Object.keys(credential).forEach((k) => credential[k] === undefined && delete credential[k]);
-
-      return credential;
     };
 
     const normalizedCredentials = [];
@@ -1126,7 +1119,7 @@ app.post("/share/create", async (req, res) => {
 
     await DB.saveShareToDB(token, presentationId, ownerDid || presentationRow.ownerDid || null, payload, expiresAt);
 
-    const base = process.env.SHARE_BASE_URL || `http://localhost:${PORT}`;
+    const base = process.env.SHARE_BASE_URL || `http://localhost:${FRONTEND_PORT}`;
     const shareUrl = `${base}/share/view/${token}`;
 
     res.json({ success: true, token, shareUrl, expiresAt: expiresAt.toISOString() });
